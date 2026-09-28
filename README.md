@@ -18,7 +18,6 @@ same name and behavior is planned next
 - [Exit codes](#exit-codes)
 - [Why bash first, Go next](#why-bash-first-go-next)
 
-
 ## Pre-Reqs
 
 - `bash`, `curl`, `jq`
@@ -33,6 +32,17 @@ export TYPESAFE_API_KEY=your_key_here
 picks it up too.)
 
 ## Quick start
+
+Download the yorn script from this repo or simply run:
+
+```bash
+curl -fsSL https://github.com/rosmur/yorn/blob/main/yorn -o yorn \                        
+&& chmod +x yorn 
+```
+
+*Then start just start using it wherever!*
+
+It can handle any classification with intelligence, unlocking a class of capabilites and features that previous classifiers like spam filters etc. didn't allow
 
 ```bash
 $ yorn -d 'URGENT!! You have won $1,000,000 - click NOW!' -q "Is this truly urgent?"
@@ -60,7 +70,7 @@ shell conditionals like `grep` or `test`.
 
 ## Usage
 
-```
+```bash
 yorn [OPTIONS] QUESTION
 ```
 
@@ -69,7 +79,7 @@ The document comes from stdin by default, or from `-d TEXT` / `-f PATH`.
 ## Flags
 
 | Flag | Meaning |
-|---|---|
+| --- | --- |
 | `-q, --question TEXT` | the question (alternative to positional) |
 | `-d, --doc TEXT` | inline document |
 | `-f, --file PATH` | document from file (`-` = stdin) |
@@ -207,7 +217,7 @@ API.
 ## Exit codes
 
 | Code | Meaning |
-|---|---|
+| --- | --- |
 | 0 | yes (`noul >= threshold`) |
 | 1 | no (`noul < threshold`) |
 | 2 | usage error — bad flags, missing question/document/API key, bad threshold |
