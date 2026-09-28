@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# yorn — ask a yes/no question about any text, get back `yes` or `no`.
+# Stage-0 bash prototype of yorn/spec.md. Requires curl and jq.
+#
+# Exit codes: 0 yes, 1 no, 2 usage error, 3 runtime/API error.
+
+set -u
+
+VERSION="0.1.0-bash"
+BASE_URL="${TYPESAFE_BASE_URL:-https://api.typesafe.ai}"
+
+usage_err() { printf 'yorn: %s\n' "$1" >&2; exit 2; }
+runtime_err() { printf 'yorn: %s\n' "$1" >&2; exit 3; }
+
+usage() {
+  cat <<'EOF'
+usage: yorn [OPTIONS] QUESTION
+
+Ask a yes/no question about a document; prints yes or no.
+Document comes from stdin, or -d/--doc, or -f/--file.
+Exit code: 0 = yes, 1 = no, 2 = usage error, 3 = runtime error.
+
+  -q, --question TEXT    the question (alternative to positional)
+  -d, --doc TEXT         inline document
+  -f, --file PATH        document from file (- = stdin)
+  -t, --threshold FLOAT  yes/no cutoff in [0,1], default 0.5
+  -p, --prob             print the probability instead of yes/no
+  -m, --model MODEL      model id, default speed_latest
+      --yes-means TEXT   what the "yes" end means (Noul criteria)
+      --no-means TEXT    what the "no" end means (Noul criteria)
+      --json             print raw API response
+      --quiet            no stdout; exit code only
+      --timeout DURATION end-to-end deadline, default 5s
+      --max-doc-bytes N  document size cap, default 1 MiB
+  -h, --help             show this help
+      --version          print version
+
+Requires TYPESAFE_API_KEY in the environment.
+EOF
+}
+
+command -v curl >/dev/null 2>&1 || runtime_err "curl not found"
+command -v jq   >/dev/null 2>&1 || runtime_err "jq not found"
+
+question="" positional=""
+doc="" doc_set=0 file="" file_set=0
+threshold="0.5" prob_mode=0 json_mode=0 quiet=0
+yes_means="" yes_means_set=0 no_means="" no_means_set=0
+model="speed_latest"
+timeout="5s" max_doc_bytes=$((1024 * 1024))
+
+need_val() { [[ $# -ge 2 ]] || usage_err "$1 requires a value"; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -q|--question)   need_val "$@"; question="$2"; shift 2 ;;
+    -d|--doc)        need_val "$@"; doc="$2"; doc_set=1; shift 2 ;;
+    -f|--file)       need_val "$@"; file="$2"; file_set=1; shift 2 ;;
+    -t|--threshold)  need_val "$@"; threshold="$2"; shift 2 ;;
+    -p|--prob)       prob_mode=1; shift ;;
+    --yes-means)     need_val "$@"; yes_means="$2"; yes_means_set=1; shift 2 ;;
+    --no-means)      need_val "$@"; no_means="$2"; no_means_set=1; shift 2 ;;
+    --json)          json_mode=1; shift ;;
+    --quiet)         quiet=1; shift ;;
+    --timeout)       need_val "$@"; timeout="$2"; shift 2 ;;
+    --max-doc-bytes) need_val "$@"; max_doc_bytes="$2"; shift 2 ;;
+    -m|--model)      need_val "$@"; model="$2"; shift 2 ;;
+    -h|--help)       usage; exit 0 ;;
+    --version)       printf 'yorn %s\n' "$VERSION"; exit 0 ;;
+    --)              shift; while [[ $# -gt 0 ]]; do
+                       [[ -n "$positional" ]] && usage_err "more than one question given"
+                       positional="$1"; shift
+                     done ;;
+    -*)              usage_err "unknown flag: $1 (see --help)" ;;
+    *)               [[ -n "$positional" ]] && usage_err "more than one question given"
+                     positional="$1"; shift ;;
+  esac
+done
+
+# --- question ---------------------------------------------------------------
+if [[ -n "$positional" && -n "$question" ]]; then
+  usage_err "question given both as argument and via -q/--question"
+fi
+[[ -n "$positional" ]] && question="$positional"
+[[ -z "${question//[$' \t\r\n']/}" ]] && usage_err "no question given (see --help)"
+
+# --- flag validation --------------------------------------------------------
+[[ $prob_mode -eq 1 && $json_mode -eq 1 ]] && usage_err "-p and --json are mutually exclusive"
+
+LC_ALL=C awk -v t="$threshold" 'BEGIN { exit !(t ~ /^[0-9.]+$/ && t >= 0 && t <= 1) }' \
+  || usage_err "threshold must be a number in [0, 1], got '$threshold'"
+
+[[ "$max_doc_bytes" =~ ^[0-9]+$ && "$max_doc_bytes" -gt 0 ]] \
+  || usage_err "--max-doc-bytes must be a positive integer, got '$max_doc_bytes'"
+
+[[ -z "${model//[$' \t\r\n']/}" ]] \
+  && usage_err "model must be a non-empty id, got '$model'"
+
+timeout_secs="${timeout%s}"
+LC_ALL=C awk -v t="$timeout_secs" 'BEGIN { exit !(t ~ /^[0-9.]+$/ && t > 0) }' \
+  || usage_err "--timeout must be a positive duration like 5s, got '$timeout'"
+
+[[ -z "${TYPESAFE_API_KEY:-}" ]] && usage_err "TYPESAFE_API_KEY is not set"
+
+# --- document (exactly one source) -------------------------------------------
+[[ $doc_set -eq 1 && $file_set -eq 1 ]] && usage_err "-d and -f are mutually exclusive"
+
+if [[ $doc_set -eq 1 ]]; then
+  :
+elif [[ $file_set -eq 1 ]]; then
+  if [[ "$file" == "-" ]]; then
+    doc="$(cat)" || runtime_err "failed to read stdin"
+  else
+    [[ -e "$file" ]] || usage_err "no such file: $file"
+    [[ -r "$file" ]] || usage_err "cannot read file: $file"
+    doc="$(cat -- "$file")" || runtime_err "failed to read file: $file"
+  fi
+elif [[ ! -t 0 ]]; then
+  doc="$(cat)" || runtime_err "failed to read stdin"
+else
+  usage_err "no document: pipe one in, or use -d TEXT / -f PATH"
+fi
+
+[[ -z "${doc//[$' \t\r\n']/}" ]] && usage_err "document is empty"
+
+doc_bytes=$(LC_ALL=C printf '%s' "$doc" | wc -c)
+[[ "$doc_bytes" -gt "$max_doc_bytes" ]] \
+  && usage_err "document is ${doc_bytes} bytes, over the ${max_doc_bytes}-byte cap (--max-doc-bytes to raise)"
+
+# --- build request (jq handles all JSON escaping) -----------------------------
+body=$(jq -n \
+  --arg doc "$doc" \
+  --arg q "$question" \
+  --arg ym "$yes_means" --argjson ym_set "$yes_means_set" \
+  --arg nm "$no_means" --argjson nm_set "$no_means_set" \
+  --arg model "$model" \
+  '{
+    document: $doc,
+    model: $model,
+    questions: { q: ({ type: "noul", instructions: $q }
+      + (if $ym_set == 1 or $nm_set == 1 then
+           { criteria: ((if $ym_set == 1 then { true: $ym } else {} end)
+                      + (if $nm_set == 1 then { false: $nm } else {} end)) }
+         else {} end)) }
+  }') || runtime_err "failed to build request body"
+
+# --- call the API -------------------------------------------------------------
+http_response=$(printf '%s' "$body" | curl -sS \
+  --max-time "$timeout_secs" \
+  --write-out $'\n%{http_code}' \
+  --header "Authorization: Bearer $TYPESAFE_API_KEY" \
+  --header "Content-Type: application/json" \
+  --data @- \
+  "$BASE_URL/v1/systemone" 2>/dev/null)
+curl_status=$?
+
+case $curl_status in
+  0)  ;;
+  28) runtime_err "timeout after $timeout" ;;
+  6)  runtime_err "could not resolve host for $BASE_URL" ;;
+  7)  runtime_err "could not connect to $BASE_URL" ;;
+  *)  runtime_err "network error (curl exit $curl_status)" ;;
+esac
+
+http_code="${http_response##*$'\n'}"
+resp_body="${http_response%$'\n'*}"
+
+if [[ "$http_code" != 2* ]]; then
+  api_msg=$(jq -r '.error.message // .error // .message // empty' <<<"$resp_body" 2>/dev/null)
+  runtime_err "api error ${http_code}${api_msg:+: $api_msg}"
+fi
+
+noul=$(jq -er '.answers.q.noul' <<<"$resp_body" 2>/dev/null) \
+  || runtime_err "unexpected response shape (no .answers.q.noul)"
+
+# --- answer -------------------------------------------------------------------
+if LC_ALL=C awk -v n="$noul" -v t="$threshold" 'BEGIN { exit !(n >= t) }'; then
+  answer_exit=0; word="yes"
+else
+  answer_exit=1; word="no"
+fi
+
+if [[ $quiet -eq 0 ]]; then
+  if [[ $json_mode -eq 1 ]]; then
+    printf '%s\n' "$resp_body"
+  elif [[ $prob_mode -eq 1 ]]; then
+    LC_ALL=C printf '%.2f\n' "$noul"
+  else
+    printf '%s\n' "$word"
+  fi
+fi
+
+exit $answer_exit
